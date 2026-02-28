@@ -5,10 +5,7 @@ from copy import deepcopy
 import losses
 import numpy as np
 import torch
-import torch.nn as nn
-from flow_vis import flow_to_color
 from torch.nn import Module
-from torch.nn import functional as F
 from torchvision.transforms import ToPILImage
 
 from tools.registery import LOSS_REGISTRY
@@ -16,87 +13,31 @@ from tools.registery import LOSS_REGISTRY
 mkdir = lambda x: os.makedirs(x, exist_ok=True)
 
 
-class ForwardWarp(nn.Module):
-    """Forward warp image with optical flow."""
-
-    def __init__(self):
-        super().__init__()
-
-    def forward(self, img, flo):
-        n, c, h, w = img.size()
-
-        y = flo[:, 0:1, :, :].repeat(1, c, 1, 1)
-        x = flo[:, 1:2, :, :].repeat(1, c, 1, 1)
-
-        x1, x2 = torch.floor(x), torch.floor(x) + 1
-        y1, y2 = torch.floor(y), torch.floor(y) + 1
-
-        w11 = torch.exp(-((x - x1) ** 2 + (y - y1) ** 2))
-        w12 = torch.exp(-((x - x1) ** 2 + (y - y2) ** 2))
-        w21 = torch.exp(-((x - x2) ** 2 + (y - y1) ** 2))
-        w22 = torch.exp(-((x - x2) ** 2 + (y - y2) ** 2))
-
-        img11, o11 = self.sample_one(img, x1, y1, w11)
-        img12, o12 = self.sample_one(img, x1, y2, w12)
-        img21, o21 = self.sample_one(img, x2, y1, w21)
-        img22, o22 = self.sample_one(img, x2, y2, w22)
-
-        return img11 + img12 + img21 + img22, o11 + o12 + o21 + o22
-
-    def sample_one(self, img, shiftx, shifty, weight):
-        n, c, h, w = img.size()
-        flat_shiftx = shiftx.view(-1)
-        flat_shifty = shifty.view(-1)
-        flat_basex = torch.arange(0, h, requires_grad=False).view(-1, 1)[None, None].cuda().long().repeat(n, c, 1, w).view(-1)
-        flat_basey = torch.arange(0, w, requires_grad=False).view(1, -1)[None, None].cuda().long().repeat(n, c, h, 1).view(-1)
-        flat_weight = weight.view(-1)
-        flat_img = img.view(-1)
-
-        idxn = torch.arange(0, n, requires_grad=False).view(n, 1, 1, 1).long().cuda().repeat(1, c, h, w).view(-1)
-        idxc = torch.arange(0, c, requires_grad=False).view(1, c, 1, 1).long().cuda().repeat(n, 1, h, w).view(-1)
-        idxx = flat_shiftx.long() + flat_basex
-        idxy = flat_shifty.long() + flat_basey
-
-        mask = idxx.ge(0) & idxx.lt(h) & idxy.ge(0) & idxy.lt(w)
-        ids = idxn * c * h * w + idxc * h * w + idxx * w + idxy
-        ids_mask = torch.masked_select(ids, mask).clone().cuda()
-
-        img_warp = torch.zeros([n * c * h * w]).cuda()
-        img_warp.put_(ids_mask, torch.masked_select(flat_img * flat_weight, mask), accumulate=True)
-
-        one_warp = torch.zeros([n * c * h * w]).cuda()
-        one_warp.put_(ids_mask, torch.masked_select(flat_weight, mask), accumulate=True)
-
-        return img_warp.view(n, c, h, w), one_warp.view(n, c, h, w)
-
-
 class BaseModel(Module):
+    """Minimal training/validation base model without flow-specific branches."""
+
     def __init__(self, params):
         super().__init__()
         self.params = params
         self.train_im_path = params.paths.save.train_im_path
         self.val_im_path = os.path.join(params.paths.save.val_im_path, "images")
-        self.val_flow_save = os.path.join(params.paths.save.val_im_path, "flow")
-        self.val_flowvis_save = os.path.join(params.paths.save.val_im_path, "flow_vis")
         mkdir(self.val_im_path)
-        mkdir(self.val_flow_save)
-        mkdir(self.val_flowvis_save)
+
         self.record_txt = params.paths.save.record_txt
         self.val_record_txt = os.path.join(self.val_im_path, 'detailed_records')
         self.training_metrics = {}
         self.validation_metrics = {}
+
         self.train_print_freq = params.training_config.train_stats.print_freq
         self.train_im_save = params.training_config.train_stats.save_im_ep
         self.val_eval = params.validation_config.weights_save_freq
         self.val_im_save = params.validation_config.val_imsave_epochs
         self.interp_num = params.training_config.interp_ratio - 1
+
         self.toim = ToPILImage()
         self.metrics_init()
-        self.fwarp = ForwardWarp()
-        self.bwarp = self.backwarp
         self.params_training = None
         self.debug = params.debug
-        self.save_flow = params.save_flow
         self.save_images = params.save_images
 
     def write_log(self, logcont):
@@ -148,29 +89,6 @@ class BaseModel(Module):
         print(print_content)
         return print_content
 
-    def backwarp(self, img, flow):
-        _, _, h, w = img.size()
-        u, v = flow[:, 0, :, :], flow[:, 1, :, :]
-        gridx, gridy = np.meshgrid(np.arange(w), np.arange(h))
-        gridx = torch.tensor(gridx, requires_grad=False).cuda()
-        gridy = torch.tensor(gridy, requires_grad=False).cuda()
-        x = gridx.unsqueeze(0).expand_as(u).float() + u
-        y = gridy.unsqueeze(0).expand_as(v).float() + v
-        x = 2 * (x / w - 0.5)
-        y = 2 * (y / h - 0.5)
-        grid = torch.stack((x, y), dim=3)
-        return torch.nn.functional.grid_sample(img, grid)
-
-    def flow_resize(self, flow, target_h=None, target_w=None, scalar=None):
-        fh, fw = flow.shape[-2:]
-        if target_h is None:
-            target_h, target_w = int(fh * scalar), int(fw * scalar)
-        hr, wr = float(target_h) / float(fh), float(target_w) / float(fw)
-        flow_out = torch.nn.functional.interpolate(flow, (target_h, target_w), mode='bilinear', align_corners=True)
-        flow_out[:, 0] *= wr
-        flow_out[:, 1] *= hr
-        return flow_out
-
     def net_training(self, data_in, optim, epoch, step):
         pass
 
@@ -184,6 +102,7 @@ class BaseModel(Module):
         loss = 0
         print_content = f"MODEL {self.params.model_config.name}\tCur EPOCH/STEP/LR: [{epoch}/{step}/{lr:.6f}]\t"
         self.metrics_record["training_time"].append(time.time())
+
         for k in self.training_metrics.keys():
             func, as_loss = self.training_metrics[k]
             if k == 'ECharbonier':
@@ -196,11 +115,14 @@ class BaseModel(Module):
                 loss_item = func.forward(res.view(-1, rc, rh, rw), gt.view(-1, rc, rh, rw))
             else:
                 loss_item = func.forward(res, gt)
+
             if as_loss:
                 loss += loss_item
             self.metrics_record[f"train_{k}"].append(loss_item.item())
+
             if step % self.train_print_freq == 0:
                 print_content += f'{k}: {self.metrics_record[f"train_{k}"][-1]:.4f}\t'
+
         if step % self.train_print_freq == 0:
             print(print_content)
             with open(os.path.join(self.train_im_path, str(epoch) + '.txt'), 'a+') as f:
@@ -215,22 +137,20 @@ class BaseModel(Module):
                 val = self.validation_metrics[k].forward(res[:, n].detach(), gt[:, n].detach()).item()
                 self.metrics_record[f'val_{k}'].append(val)
                 detailed_record += f'{k}: {val:.4f}\t'
+
             with open(os.path.join(self.val_record_txt, f"{epoch}.txt"), 'a+') as f:
                 f.write(detailed_record.strip('\t') + '\n')
+
             if (epoch % max(self.params.validation_config.val_imsave_epochs, 1) == 0 and self.save_images) or not self.params.enable_training:
                 os.makedirs(os.path.join(self.val_im_path, str(epoch)), exist_ok=True)
                 rgb_name = data_in['rgb_name']
                 folder = os.path.split(data_in['folder'][0])[-1]
-                self.toim(res[0, n].detach().cpu().clamp(0, 1)).save(os.path.join(self.val_im_path, str(epoch), f"{folder}_{rgb_name[n+1][0]}_{n}_res.jpg"))
-                self.toim(gt[0, n]).save(os.path.join(self.val_im_path, str(epoch), f"{folder}_{rgb_name[n+1][0]}_{n}_gt.jpg"))
-                if self.save_flow:
-                    flow = kwargs['flow']
-                    ft0, ft1 = flow
-                    mkdir(os.path.join(self.val_flowvis_save, str(epoch)))
-                    self.toim(flow_to_color(ft0[n][0].permute(1, 2, 0).detach().cpu().numpy())).save(
-                        os.path.join(self.val_flowvis_save, str(epoch), f"{folder}_{rgb_name[n + 1][0]}_{n}_ft0.jpg"))
-                    self.toim(flow_to_color(ft1[n][0].permute(1, 2, 0).detach().cpu().numpy())).save(
-                        os.path.join(self.val_flowvis_save, str(epoch), f"{folder}_{rgb_name[n + 1][0]}_{n}_ft1.jpg"))
+                self.toim(res[0, n].detach().cpu().clamp(0, 1)).save(
+                    os.path.join(self.val_im_path, str(epoch), f"{folder}_{rgb_name[n+1][0]}_{n}_res.jpg")
+                )
+                self.toim(gt[0, n]).save(
+                    os.path.join(self.val_im_path, str(epoch), f"{folder}_{rgb_name[n+1][0]}_{n}_gt.jpg")
+                )
 
 
 class OursBase(BaseModel):
@@ -251,19 +171,23 @@ class OursBase(BaseModel):
         gts = gts.reshape(n, scalar, -1, h, w)
 
         res = self.forward(left_frame, right_frame, events, interp_ratio)
-        recon = res[0]
-        loss = self.update_training_metrics(recon, gts, epoch, step, optim.param_groups[0]['lr'], events, fuseout=res[-1])
+        recon = res[0] if isinstance(res, (list, tuple)) else res
+
+        fuseout = res[-1] if isinstance(res, (list, tuple)) else recon
+        loss = self.update_training_metrics(recon, gts, epoch, step, optim.param_groups[0]['lr'], events, fuseout=fuseout)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self.net.parameters(), 0.01)
         optim.step()
-        if epoch % self.train_im_save == 0 and step % self.train_print_freq == 0:
-            self.save_training_samples(recon, gts, events, data_in, epoch, step)
 
-    def save_training_samples(self, res, gt, events, data_in, epoch, step):
+        if epoch % self.train_im_save == 0 and step % self.train_print_freq == 0:
+            self.save_training_samples(recon, gts, data_in, epoch, step)
+
+    def save_training_samples(self, res, gt, data_in, epoch, step):
         save_folder = os.path.join(self.train_im_path, str(epoch), str(step))
         mkdir(save_folder)
         file_names = data_in['rgb_name']
         n_total, b_total = len(file_names), len(file_names[0])
+
         for n in range(n_total):
             for b in range(b_total):
                 if n == 0:
@@ -279,15 +203,15 @@ class OursBase(BaseModel):
         with torch.no_grad():
             left_frame, right_frame, events = data_in['im0'].cuda(), data_in['im1'].cuda(), data_in['events'].cuda()
             interp_ratio = data_in['interp_ratio'].item()
+
             gts = data_in['gts'].cuda().unsqueeze(2)
             scalar = interp_ratio - 1 if self.real_interp is None else self.real_interp - 1
             n, _, _, h, w = gts.shape
             gts = gts.reshape(n, scalar, -1, h, w)
 
             res = self.forward(left_frame, right_frame, events, interp_ratio)
-            recon = res[0]
-            flow = res[-2:]
-            self.update_validation_metrics(recon, gts, epoch, data_in, flow=flow)
+            recon = res[0] if isinstance(res, (list, tuple)) else res
+            self.update_validation_metrics(recon, gts, epoch, data_in)
 
     def forward(self, left_frame, right_frame, events, interp_ratio):
         real_interp = interp_ratio if self.real_interp is None else self.real_interp
