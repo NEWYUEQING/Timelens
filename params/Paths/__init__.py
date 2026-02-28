@@ -1,2 +1,1 @@
-from .GOPRO import GOPRO
-from .CBMNet import CBMNet
+from .BSERGB import BSERGB, hostname

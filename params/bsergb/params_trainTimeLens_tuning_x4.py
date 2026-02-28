@@ -4,7 +4,7 @@ from tools import parse_path_common
 import os
 from params.models import model_arch_config
 from tools.registery import PARAM_REGISTRY
-from params.Paths.GOPRO import hostname
+from params.Paths.BSERGB import hostname
 
 mkdir = lambda x:os.makedirs(x, exist_ok=True)
 
