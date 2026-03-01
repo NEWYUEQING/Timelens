@@ -105,7 +105,7 @@ class BaseModel(Module):
 
         for k in self.training_metrics.keys():
             func, as_loss = self.training_metrics[k]
-            if k == 'ECharbonier':
+            if k in ('ECharbonier', 'EventConsistencyLoss', 'EventConsistencyScore'):
                 events = args[0]
                 loss_item = func.forward(res, gt, events)
             elif k == "AnnealCharbonier":
@@ -212,6 +212,16 @@ class OursBase(BaseModel):
             res = self.forward(left_frame, right_frame, events, interp_ratio)
             recon = res[0] if isinstance(res, (list, tuple)) else res
             self.update_validation_metrics(recon, gts, epoch, data_in)
+
+
+    def compute_anomaly_score(self, recon, gts, events, score_fn=None):
+        """Compute event-consistent anomaly score for VAD inference.
+
+        If score_fn is None, use mean absolute reconstruction error.
+        """
+        if score_fn is None:
+            return torch.abs(recon - gts).mean()
+        return score_fn(recon, gts, events)
 
     def forward(self, left_frame, right_frame, events, interp_ratio):
         real_interp = interp_ratio if self.real_interp is None else self.real_interp
